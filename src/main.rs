@@ -1,11 +1,11 @@
 //! Оптимизированный VAD с верификацией диктора
 //!
-//! Версия 5: Полная оптимизация + Speaker Verification
-//! - Увеличен FRAME_SIZE до 512 (32мс вместо 16мс) для снижения CPU нагрузки на 40%
-//! - Удалена pitch detection из горячего цикла (перенесена только на калибровку)
-//! - Добавлена верификация диктора на основе MFCC + косинусное сходство
-//! - Вынос системного мониторинга в отдельный поток
-//! - Оптимизированное потребление: <10% CPU, <100MB RAM, задержка <250мс
+//! Версия 6: Исправление калибровки и фильтров
+//! - FRAME_SIZE = 256 (оптимально для earshot)
+//! - Упрощена логика confirmed_voiced (убраны лишние проверки ZCR и noise_floor)
+//! - Калибровка использует score > 0.5 вместо confirmed_voiced
+//! - MAX_ZCR увеличен до 0.25 для пропуска нормальной речи
+//! - ONSET_RATIO/SUSTAIN_RATIO снижены для более чувствительного обнаружения
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -19,15 +19,15 @@ use cpal::{SampleFormat, SampleRate, StreamConfig};
 use earshot::Detector;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-// --- Основные параметры VAD (ОПТИМИЗИРОВАНО) ----------------------------
-const FRAME_SIZE: usize = 512; // Увеличено с 256 до 512 → 32мс вместо 16мс
+// --- Основные параметры VAD ---------------------------------------------
+const FRAME_SIZE: usize = 256; // 16мс при 16kHz - оптимальный размер для earshot
 const SAMPLE_RATE: u32 = 16_000;
 const VAD_THRESHOLD: f32 = 0.5;
 
 // --- Параметры сглаживания/фильтрации -----------------------------------
 const HISTORY_FRAMES: usize = 8; // Уменьшено с 10 до 8 (компенсация увеличенного FRAME_SIZE)
-const ONSET_RATIO: f32 = 0.75;
-const SUSTAIN_RATIO: f32 = 0.60;
+const ONSET_RATIO: f32 = 0.50; // Снижено с 0.75 до 0.50 для более чувствительного обнаружения речи
+const SUSTAIN_RATIO: f32 = 0.40; // Снижено с 0.60 до 0.40 для удержания состояния речи
 const HANGOVER_MS: u64 = 400;
 const MIN_SEGMENT_MS: u64 = 250;
 const NOISE_FLOOR_ALPHA: f32 = 0.05;
@@ -37,8 +37,8 @@ const CALIBRATION_SECONDS: f32 = 3.0;
 
 const CLEAR_LINE: &str = "\r\x1b[2K";
 const HPF_ALPHA: f32 = 0.97;
-const MAX_ZCR: f32 = 0.15;
-const MIN_CONSECUTIVE_FRAMES: usize = 2; // Уменьшено с 3 до 2 (т.к. фреймы теперь больше)
+const MAX_ZCR: f32 = 0.25; // Увеличено с 0.15 до 0.25 для пропуска нормальной речи
+const MIN_CONSECUTIVE_FRAMES: usize = 1; // Снижено с 2 до 1 для более быстрого реагирования
 const DEBUG_LOGGING: bool = true;
 
 // --- Speaker Verification параметры --------------------------------------
@@ -605,10 +605,9 @@ impl VadEngine {
 
         let consecutive_ok = self.consecutive_voiced >= MIN_CONSECUTIVE_FRAMES;
 
+        // Упрощенная логика confirmed_voiced: доверяем earshot больше
         let confirmed_voiced = self.history.len() == HISTORY_FRAMES
             && voiced_ratio >= required_ratio
-            && above_noise_floor
-            && zcr_ok
             && consecutive_ok;
 
         if confirmed_voiced {
@@ -731,8 +730,8 @@ fn main() {
     );
 
     let calibration_end = Instant::now() + Duration::from_secs_f32(CALIBRATION_SECONDS);
-    let mut cal_pitches: Vec<f32> = Vec::new();
     let mut cal_rms: Vec<f32> = Vec::new();
+    let mut cal_scores: Vec<f32> = Vec::new();
     let mut sys_counter = 0;
 
     while Instant::now() < calibration_end && running.load(Ordering::SeqCst) {
@@ -746,11 +745,10 @@ fn main() {
             // Сбор статистики даже при калибровке
             stats.add_frame(r.rms, r.zcr, r.confirmed_voiced);
 
-            if r.confirmed_voiced {
+            // Используем score > 0.5 вместо confirmed_voiced для сбора данных калибровки
+            if r.score > 0.5 {
                 cal_rms.push(r.rms);
-                if let Some(p) = r.pitch {
-                    cal_pitches.push(p);
-                }
+                cal_scores.push(r.score);
             }
 
             // Обновление системных метрик реже (раз в 10 кадров ~200мс)
@@ -773,29 +771,22 @@ fn main() {
         return;
     }
 
-    let profile = if cal_pitches.len() >= 3 {
-        let mut sorted = cal_pitches.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let lo_idx = sorted.len() / 10;
-        let hi_idx = sorted.len() - 1 - sorted.len() / 10;
-        let pitch_min = sorted[lo_idx] * 0.85;
-        let pitch_max = sorted[hi_idx] * 1.15;
-        let rms_avg = if cal_rms.is_empty() {
-            0.0
-        } else {
-            cal_rms.iter().sum::<f32>() / cal_rms.len() as f32
-        };
+    // Создаем профиль на основе RMS и score, а не pitch
+    let profile = if cal_rms.len() >= 3 {
+        let rms_avg = cal_rms.iter().sum::<f32>() / cal_rms.len() as f32;
+        let score_avg = cal_scores.iter().sum::<f32>() / cal_scores.len() as f32;
         println!(
-            "Калибровка завершена: высота голоса ~{:.0}-{:.0} Гц, средняя громкость {:.0}",
-            pitch_min, pitch_max, rms_avg
+            "Калибровка завершена: средняя громкость {:.0}, средний score {:.2}",
+            rms_avg, score_avg
         );
         Some(VoiceProfile {
-            pitch_min,
-            pitch_max,
+            pitch_min: 80.0, // Заглушка, т.к. pitch больше не используется
+            pitch_max: 400.0,
             rms_avg,
         })
     } else {
         println!("Во время калибровки не удалось надёжно распознать голос.");
+        println!("Собрано кадров с речью: {} (требуется минимум 3)", cal_rms.len());
         None
     };
 
