@@ -9,11 +9,10 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::thread;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
@@ -175,12 +174,13 @@ fn compute_mfcc(samples: &[i16]) -> Vec<f32> {
         return vec![0.0; MFCC_NUM_COEFFS];
     }
     
+    let coeff_count = all_coeffs.len() as f32;
     all_coeffs.into_iter()
         .fold(vec![0.0; MFCC_NUM_COEFFS], |acc, x| {
             acc.iter().zip(x.iter()).map(|(&a, &b)| a + b).collect()
         })
         .iter()
-        .map(|&v| v / all_coeffs.len() as f32)
+        .map(|&v| v / coeff_count)
         .collect()
 }
 
@@ -368,6 +368,12 @@ struct VoiceProfile {
     rms_avg: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Silence,
+    Speech,
+}
+
 fn rms(samples: &[i16]) -> f32 {
     let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
     (sum_sq / samples.len() as f64).sqrt() as f32
@@ -421,6 +427,48 @@ impl HighPassFilter {
 fn median(v: &[f32]) -> Option<f32> {
     if v.is_empty() {
         return None;
+    }
+
+    fn report_segment(
+        duration: Duration,
+        peak_score: f32,
+        pitches: &[f32],
+        rms_values: &[f32],
+        profile: &Option<VoiceProfile>,
+    ) {
+        let pitch_med = median(pitches);
+        let rms_avg = if rms_values.is_empty() {
+            0.0
+        } else {
+            rms_values.iter().sum::<f32>() / rms_values.len() as f32
+        };
+
+        let speaker_label = match (profile, pitch_med) {
+            (Some(p), Some(pm)) if pm >= p.pitch_min && pm <= p.pitch_max && rms_avg >= p.rms_avg * 0.7 => {
+                "похож на калиброванный голос"
+            }
+            (Some(_), Some(_)) => "другой голос",
+            (Some(_), None) => "голос (без оценки высоты)",
+            (None, _) => "голос",
+        };
+
+        match pitch_med {
+            Some(pm) => println!(
+                "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | pitch ~{:.0} Гц | rms {:.0} | {}",
+                duration.as_millis(),
+                peak_score,
+                pm,
+                rms_avg,
+                speaker_label
+            ),
+            None => println!(
+                "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | rms {:.0} | {}",
+                duration.as_millis(),
+                peak_score,
+                rms_avg,
+                speaker_label
+            ),
+        }
     }
     let mut sorted = v.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
