@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use earshot::Detector;
-use sysinfo::{ProcessExt, System, SystemExt};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 // --- Основные параметры VAD ---------------------------------------------
 const FRAME_SIZE: usize = 256;
@@ -494,10 +494,11 @@ fn main() {
 
     // Инициализация sysinfo
     let mut sys = System::new_all();
-    let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
-    sys.refresh_process_specifics(
-        pid,
-        sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+    let pid = Pid::from(std::process::id() as usize);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        false,
+        ProcessRefreshKind::everything().with_cpu().with_memory(),
     );
 
     // --- Калибровка ---------------------------------------------------
@@ -532,9 +533,10 @@ fn main() {
             // Обновление системных метрик реже (раз в 10 кадров ~200мс)
             sys_counter += 1;
             if sys_counter % 10 == 0 {
-                sys.refresh_process_specifics(
-                    pid,
-                    sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+                sys.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    false,
+                    ProcessRefreshKind::everything().with_cpu().with_memory(),
                 );
                 if let Some(process) = sys.process(pid) {
                     stats.add_system_metrics(process.cpu_usage(), process.memory());
@@ -663,9 +665,10 @@ fn main() {
 
                 if sys_counter % 5 == 0 {
                     // Примерно раз в 400мс
-                    sys.refresh_process_specifics(
-                        pid,
-                        sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+                    sys.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        false,
+                        ProcessRefreshKind::everything().with_cpu().with_memory(),
                     );
                     if let Some(process) = sys.process(pid) {
                         let cpu = process.cpu_usage();
@@ -693,7 +696,7 @@ fn main() {
                     );
                 } else {
                     print!(
-                        "{CLEAR_line}[{bar}] score {:.2}  {} {} {}",
+                        "{CLEAR_LINE}[{bar}] score {:.2}  {} {} {}",
                         r.score, label, cpu_str, ram_str
                     );
                 }
