@@ -1,86 +1,138 @@
 //! Небольшой проект для проверки работоспособности VAD-библиотеки earshot
 //! (https://github.com/pykeio/earshot).
 //!
-//! Что делает:
-//! 1. Слушает микрофон и прогоняет аудио через earshot::Detector.
-//! 2. В первые несколько секунд проводит "калибровку": строит грубый
-//!    голосовой профиль (диапазон высоты тона + громкость) человека,
-//!    который заговорил первым.
-//! 3. Дальше в реальном времени выделяет реплики (сегменты речи) и для
-//!    каждой целиком - а не по отдельным 16-мс кадрам - решает, похожа ли
-//!    она на калиброванный голос.
-//!
-//! Версия 3: Улучшенная фильтрация шумов (Вариант A):
-//! - High-Pass Filter (80 Гц) для отсечения ветра и низкочастотного гула
-//! - Zero Crossing Rate (ZCR) для фильтрации белого шума
-//! - Гистерезис порогов (onset/sustain) для стабильности
-//! - Требование N кадров подряд для срабатывания
-//! - Отладочное логирование параметров
-//!
-//! ВАЖНО: earshot - это исключительно детектор голосовой активности (VAD),
-//! он НЕ делает идентификацию/верификацию диктора. "Подстройка под голос"
-//! здесь - простая эвристика поверх VAD (высота тона + громкость), а не
-//! настоящее распознавание диктора.
+//! Версия 4: Добавлен мониторинг CPU/RAM и детальная статистика сессии.
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, StreamConfig};
 use earshot::Detector;
+use sysinfo::{ProcessExt, System, SystemExt};
 
 // --- Основные параметры VAD ---------------------------------------------
-
-/// earshot требует кадры ровно по 256 сэмплов (16 мс) при 16 кГц.
 const FRAME_SIZE: usize = 256;
 const SAMPLE_RATE: u32 = 16_000;
-/// Порог по умолчанию, рекомендованный документацией earshot.
 const VAD_THRESHOLD: f32 = 0.5;
 
-// --- Параметры сглаживания/фильтрации (УЛУЧШЕННАЯ ВЕРСИЯ) ---------------
-
-/// Сколько последних кадров учитывать при решении "точно ли началась речь".
-/// 10 кадров по 16 мс = ~160 мс контекста (увеличено с 6 для стабильности).
+// --- Параметры сглаживания/фильтрации -----------------------------------
 const HISTORY_FRAMES: usize = 10;
-/// Доля кадров в этом окне для ВКЛЮЧЕНИЯ (onset) - строже чем раньше.
 const ONSET_RATIO: f32 = 0.75;
-/// Доля кадров в этом окне для УДЕРЖАНИЯ (sustain) - мягче, чтобы речь не прерывалась.
 const SUSTAIN_RATIO: f32 = 0.60;
-/// Сколько миллисекунд тишины подряд нужно, чтобы закрыть реплику.
 const HANGOVER_MS: u64 = 400;
-/// Реплики короче этого считаются шумом/щелчком и отбрасываются целиком.
-const MIN_SEGMENT_MS: u64 = 250; // увеличено с 200
-/// Скорость адаптации фонового шумового уровня (эксп. скользящее среднее).
+const MIN_SEGMENT_MS: u64 = 250;
 const NOISE_FLOOR_ALPHA: f32 = 0.05;
-/// Во сколько раз кадр должен быть громче шумового пола.
-const NOISE_FLOOR_MARGIN: f32 = 1.5; // увеличено с 1.3
+const NOISE_FLOOR_MARGIN: f32 = 1.5;
 
-/// Окно для оценки высоты тона автокорреляцией.
 const PITCH_WINDOW_LEN: usize = 1024;
-/// Сколько секунд слушать при калибровке.
 const CALIBRATION_SECONDS: f32 = 3.0;
 
-/// ANSI: очистить текущую строку терминала.
 const CLEAR_LINE: &str = "\r\x1b[2K";
-
-/// Коэффициент для HPF (High-Pass Filter) - частота среза ~80 Гц.
-/// Формула: alpha = rc / (rc + dt), где rc = 1/(2*pi*fc), dt = 1/sample_rate
-/// Для fc=80 Гц при 16 кГц: alpha ≈ 0.97
 const HPF_ALPHA: f32 = 0.97;
-
-/// Максимальный ZCR для голоса (при 16 кГц). Выше - скорее всего шум.
-/// Голос: ~100-500 пересечений/сек, ветер/шум: >1000.
-const MAX_ZCR: f32 = 0.15; // доля от частоты дискретизации (0.15 * 16000 = 2400)
-
-/// Минимальное количество кадров подряд со score > порога для срабатывания.
+const MAX_ZCR: f32 = 0.15;
 const MIN_CONSECUTIVE_FRAMES: usize = 3;
-
-/// Включить отладочное логирование (ZCR, RMS, статус).
 const DEBUG_LOGGING: bool = true;
 
-/// Грубый "голосовой профиль" человека, инициализировавшего диалог.
+// --- Структура для статистики -------------------------------------------
+struct VadStats {
+    total_frames: u64,
+    speech_frames: u64,
+    total_rms: f64,
+    total_zcr: f64,
+    start_time: Instant,
+
+    // Системные метрики
+    cpu_samples: Vec<f32>,
+    ram_samples: Vec<u64>,
+    max_cpu: f32,
+    max_ram: u64,
+}
+
+impl VadStats {
+    fn new() -> Self {
+        Self {
+            total_frames: 0,
+            speech_frames: 0,
+            total_rms: 0.0,
+            total_zcr: 0.0,
+            start_time: Instant::now(),
+            cpu_samples: Vec::new(),
+            ram_samples: Vec::new(),
+            max_cpu: 0.0,
+            max_ram: 0,
+        }
+    }
+
+    fn add_frame(&mut self, rms: f32, zcr: f32, is_speech: bool) {
+        self.total_frames += 1;
+        if is_speech {
+            self.speech_frames += 1;
+        }
+        self.total_rms += rms as f64;
+        self.total_zcr += zcr as f64;
+    }
+
+    fn add_system_metrics(&mut self, cpu: f32, ram: u64) {
+        self.cpu_samples.push(cpu);
+        self.ram_samples.push(ram);
+        if cpu > self.max_cpu {
+            self.max_cpu = cpu;
+        }
+        if ram > self.max_ram {
+            self.max_ram = ram;
+        }
+    }
+
+    fn avg_rms(&self) -> f32 {
+        if self.total_frames == 0 {
+            0.0
+        } else {
+            (self.total_rms / self.total_frames as f64) as f32
+        }
+    }
+
+    fn avg_zcr(&self) -> f32 {
+        if self.total_frames == 0 {
+            0.0
+        } else {
+            (self.total_zcr / self.total_frames as f64) as f32
+        }
+    }
+
+    fn avg_cpu(&self) -> f32 {
+        if self.cpu_samples.is_empty() {
+            0.0
+        } else {
+            self.cpu_samples.iter().sum::<f32>() / self.cpu_samples.len() as f32
+        }
+    }
+
+    fn avg_ram(&self) -> u64 {
+        if self.ram_samples.is_empty() {
+            0
+        } else {
+            self.ram_samples.iter().sum::<u64>() / self.ram_samples.len() as u64
+        }
+    }
+
+    fn duration(&self) -> Duration {
+        self.start_time.elapsed()
+    }
+
+    fn speech_percentage(&self) -> f32 {
+        if self.total_frames == 0 {
+            0.0
+        } else {
+            (self.speech_frames as f32 / self.total_frames as f32) * 100.0
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct VoiceProfile {
     pitch_min: f32,
@@ -93,8 +145,6 @@ fn rms(samples: &[i16]) -> f32 {
     (sum_sq / samples.len() as f64).sqrt() as f32
 }
 
-/// Вычисляет Zero Crossing Rate (доля пересечений нуля).
-/// Для голоса типично 0.01-0.05, для шума/ветра > 0.1.
 fn zcr(samples: &[i16]) -> f32 {
     if samples.len() < 2 {
         return 0.0;
@@ -108,8 +158,6 @@ fn zcr(samples: &[i16]) -> f32 {
     crossings as f32 / samples.len() as f32
 }
 
-/// Простейший IIR high-pass фильтр первого порядка.
-/// Отсекает низкие частоты (ветер, гул) ниже ~80 Гц.
 struct HighPassFilter {
     y_prev: f32,
     x_prev: f32,
@@ -127,7 +175,7 @@ impl HighPassFilter {
         samples
             .iter()
             .map(|&x| {
-                let x_norm = x as f32 / 32768.0; // нормализуем к [-1, 1]
+                let x_norm = x as f32 / 32768.0;
                 let y = HPF_ALPHA * (self.y_prev + x_norm - self.x_prev);
                 self.x_prev = x_norm;
                 self.y_prev = y;
@@ -151,11 +199,9 @@ fn median(v: &[f32]) -> Option<f32> {
     Some(sorted[sorted.len() / 2])
 }
 
-/// Простейшая оценка высоты основного тона автокорреляцией во временной
-/// области. Годится для демонстрации, не для продакшена.
 fn estimate_pitch(window: &[i16], sample_rate: u32) -> Option<f32> {
-    let min_freq = 70.0_f32; // нижняя граница (низкий мужской голос)
-    let max_freq = 400.0_f32; // верхняя граница (высокий женский/детский голос)
+    let min_freq = 70.0_f32;
+    let max_freq = 400.0_f32;
     let min_lag = (sample_rate as f32 / max_freq) as usize;
     let max_lag = (sample_rate as f32 / min_freq) as usize;
     if window.len() <= max_lag {
@@ -186,21 +232,14 @@ fn estimate_pitch(window: &[i16], sample_rate: u32) -> Option<f32> {
     }
 }
 
-/// Результат обработки одного 16-мс кадра.
 struct FrameResult {
     score: f32,
-    /// Сглаженное, отфильтрованное решение "это точно голос" - в отличие
-    /// от сырого `score >= VAD_THRESHOLD`, которое дёргается кадр от кадра.
     confirmed_voiced: bool,
     pitch: Option<f32>,
     rms: f32,
     zcr: f32,
 }
 
-/// Обёртка над earshot::Detector, которая добавляет сглаживание onset,
-/// оценку высоты тона и адаптивный шумовой пол. Используется одинаково
-/// и на калибровке, и в основном цикле - это и даёт стабильность:
-/// одна и та же логика фильтрации применяется везде.
 struct VadEngine {
     detector: Detector,
     history: VecDeque<bool>,
@@ -209,7 +248,7 @@ struct VadEngine {
     noise_floor_initialized: bool,
     hpf: HighPassFilter,
     consecutive_voiced: usize,
-    is_speech_state: bool, // для гистерезиса
+    is_speech_state: bool,
 }
 
 impl VadEngine {
@@ -226,8 +265,6 @@ impl VadEngine {
         }
     }
 
-    /// Сбрасывает внутреннее состояние - вызывать при смене режима работы
-    /// (например, после калибровки перед "боевым" прослушиванием).
     fn reset(&mut self) {
         self.detector.reset();
         self.history.clear();
@@ -237,30 +274,22 @@ impl VadEngine {
     }
 
     fn process_frame(&mut self, frame: &[i16]) -> FrameResult {
-        // Применяем HPF для отсечения низкочастотного шума (ветер)
         let filtered_frame = self.hpf.process(frame);
-        
         let score = self.detector.predict_i16(&filtered_frame);
         let raw_voiced = score >= VAD_THRESHOLD;
-
-        // Считаем ZCR до фильтрации (оригинальный сигнал)
         let zcr_val = zcr(frame);
-        
-        // Проверка ZCR: если слишком высокий - скорее всего шум
         let zcr_ok = zcr_val <= MAX_ZCR;
 
         self.history.push_back(raw_voiced && zcr_ok);
         if self.history.len() > HISTORY_FRAMES {
             self.history.pop_front();
         }
-        
-        // Гистерезис: разные пороги для включения и удержания
+
         let required_ratio = if self.is_speech_state {
             SUSTAIN_RATIO
         } else {
             ONSET_RATIO
         };
-        
         let voiced_ratio =
             self.history.iter().filter(|&&v| v).count() as f32 / self.history.len().max(1) as f32;
 
@@ -277,9 +306,6 @@ impl VadEngine {
 
         let level = rms(&filtered_frame);
 
-        // Пока сырой VAD явно не видит голоса - медленно подстраиваем
-        // оценку фонового шума. Помогает не путать ровный гул/шипение
-        // на грани порога с настоящим голосом.
         if !raw_voiced {
             if !self.noise_floor_initialized {
                 self.noise_floor = level;
@@ -292,13 +318,12 @@ impl VadEngine {
         let above_noise_floor =
             !self.noise_floor_initialized || level > self.noise_floor * NOISE_FLOOR_MARGIN;
 
-        // Требуем N кадров подряд для срабатывания
         if raw_voiced && zcr_ok && above_noise_floor {
             self.consecutive_voiced += 1;
         } else {
             self.consecutive_voiced = 0;
         }
-        
+
         let consecutive_ok = self.consecutive_voiced >= MIN_CONSECUTIVE_FRAMES;
 
         let confirmed_voiced = self.history.len() == HISTORY_FRAMES
@@ -307,7 +332,6 @@ impl VadEngine {
             && zcr_ok
             && consecutive_ok;
 
-        // Обновляем состояние для гистерезиса
         if confirmed_voiced {
             self.is_speech_state = true;
         } else if voiced_ratio < SUSTAIN_RATIO {
@@ -330,9 +354,6 @@ enum State {
     Speech,
 }
 
-/// Печатает итог по завершённой реплике: длительность, пиковый score,
-/// медианную высоту тона за всю реплику (а не за один кадр - это и убирает
-/// прежнее "мигание" между похоже/не похоже) и вердикт по профилю.
 fn report_segment(
     duration: Duration,
     peak_score: f32,
@@ -379,7 +400,54 @@ fn report_segment(
     }
 }
 
+fn print_final_stats(stats: &VadStats) {
+    println!("\n\n{}", "=".repeat(60));
+    println!("📈 ИТОГОВАЯ СТАТИСТИКА СЕССИИ");
+    println!("{}", "=".repeat(60));
+
+    println!(
+        "⏱️  Длительность:          {:.2} сек",
+        stats.duration().as_secs_f64()
+    );
+    println!("📦 Всего фреймов:        {}", stats.total_frames);
+    println!(
+        "🗣️  Фреймов с голосом:    {} ({:.1}%)",
+        stats.speech_frames,
+        stats.speech_percentage()
+    );
+    println!(
+        "🔇 Фреймов тишины:       {}",
+        stats.total_frames - stats.speech_frames
+    );
+    println!("📊 Средний RMS:          {:.6}", stats.avg_rms());
+    println!("〰️  Средний ZCR:           {:.4}", stats.avg_zcr());
+
+    println!("\n💻 СИСТЕМНЫЕ РЕСУРСЫ (средние / пиковые):");
+    println!(
+        "🔹 Загрузка CPU:          {:>6.1}% / {:>6.1}%",
+        stats.avg_cpu(),
+        stats.max_cpu
+    );
+    println!(
+        "🔹 Потребление RAM:       {:>6} КБ / {:>6} КБ",
+        stats.avg_ram(),
+        stats.max_ram
+    );
+    println!("{}\n", "=".repeat(60));
+}
+
 fn main() {
+    // Настройка обработки Ctrl+C
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    if let Err(e) = ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+        println!("\n⏹️  Получен сигнал остановки...");
+    }) {
+        eprintln!("Warning: Could not set Ctrl+C handler: {}", e);
+    }
+
     println!("=== Проверка работоспособности earshot VAD ===");
     println!("https://github.com/pykeio/earshot\n");
 
@@ -392,10 +460,6 @@ fn main() {
         device.name().unwrap_or_else(|_| "неизвестно".into())
     );
 
-    // earshot жёстко требует моно, 16 кГц, i16, кадр 256 сэмплов.
-    // Просим у устройства именно такой формат напрямую; если микрофон его
-    // не поддерживает - честно останавливаемся, а не тихо портим звук
-    // самодельным ресемплингом.
     let supported_config = device
         .supported_input_configs()
         .expect("Не удалось получить поддерживаемые конфигурации ввода")
@@ -405,17 +469,10 @@ fn main() {
                 && c.min_sample_rate().0 <= SAMPLE_RATE
                 && c.max_sample_rate().0 >= SAMPLE_RATE
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "Микрофон не поддерживает моно i16 16 кГц напрямую.\n\
-                 Нужен ресемплинг (например, через crate `rubato`) - \
-                 в этом демо-проекте он не реализован."
-            )
-        })
+        .unwrap_or_else(|| panic!("Микрофон не поддерживает моно i16 16 кГц напрямую."))
         .with_sample_rate(SampleRate(SAMPLE_RATE));
 
     let config: StreamConfig = supported_config.config();
-
     let (tx, rx): (Sender<Vec<i16>>, Receiver<Vec<i16>>) = channel();
 
     let stream = device
@@ -433,40 +490,67 @@ fn main() {
 
     let mut engine = VadEngine::new();
     let mut sample_buf: Vec<i16> = Vec::new();
+    let mut stats = VadStats::new();
+
+    // Инициализация sysinfo
+    let mut sys = System::new_all();
+    let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
+    sys.refresh_process_specifics(
+        pid,
+        sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+    );
 
     // --- Калибровка ---------------------------------------------------
     println!(
-        "\nКалибровка (~{:.0} сек): скажите что-нибудь - под этот голос \
-         программа будет подстраиваться...",
+        "\nКалибровка (~{:.0} сек): скажите что-нибудь...",
         CALIBRATION_SECONDS
     );
 
     let calibration_end = Instant::now() + Duration::from_secs_f32(CALIBRATION_SECONDS);
     let mut cal_pitches: Vec<f32> = Vec::new();
     let mut cal_rms: Vec<f32> = Vec::new();
+    let mut sys_counter = 0;
 
-    while Instant::now() < calibration_end {
+    while Instant::now() < calibration_end && running.load(Ordering::SeqCst) {
         if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
             sample_buf.extend_from_slice(&chunk);
         }
         while sample_buf.len() >= FRAME_SIZE {
             let frame: Vec<i16> = sample_buf.drain(..FRAME_SIZE).collect();
             let r = engine.process_frame(&frame);
-            // Используем ту же сглаженную "confirmed_voiced", что и в
-            // боевом режиме - так калибровка меньше цепляет случайный шум.
+
+            // Сбор статистики даже при калибровке
+            stats.add_frame(r.rms, r.zcr, r.confirmed_voiced);
+
             if r.confirmed_voiced {
                 cal_rms.push(r.rms);
                 if let Some(p) = r.pitch {
                     cal_pitches.push(p);
                 }
             }
+
+            // Обновление системных метрик реже (раз в 10 кадров ~200мс)
+            sys_counter += 1;
+            if sys_counter % 10 == 0 {
+                sys.refresh_process_specifics(
+                    pid,
+                    sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+                );
+                if let Some(process) = sys.process(pid) {
+                    stats.add_system_metrics(process.cpu_usage(), process.memory());
+                }
+            }
         }
+    }
+
+    if !running.load(Ordering::SeqCst) {
+        print_final_stats(&stats);
+        return;
     }
 
     let profile = if cal_pitches.len() >= 3 {
         let mut sorted = cal_pitches.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        // Немного обрезаем края, чтобы один выброс не испортил диапазон.
         let lo_idx = sorted.len() / 10;
         let hi_idx = sorted.len() - 1 - sorted.len() / 10;
         let pitch_min = sorted[lo_idx] * 0.85;
@@ -486,21 +570,14 @@ fn main() {
             rms_avg,
         })
     } else {
-        println!(
-            "Во время калибровки не удалось надёжно распознать голос \
-             (слишком тихо или слишком коротко)."
-        );
-        println!("Дальше программа будет только детектировать голос, без сравнения с профилем.");
+        println!("Во время калибровки не удалось надёжно распознать голос.");
         None
     };
 
-    // Сбрасываем внутреннее состояние детектора и историю перед "боевым"
-    // режимом - калибровка уже прогрела их несколькими секундами аудио.
     engine.reset();
-
     println!("\nГотово. Слушаю микрофон (Ctrl+C для выхода)...\n");
 
-    // --- Основной цикл: разбиение на реплики (сегменты речи) ------------
+    // --- Основной цикл ------------------------------------------------
     let mut state = State::Silence;
     let mut segment_start: Option<Instant> = None;
     let mut last_voiced_at: Option<Instant> = None;
@@ -509,7 +586,13 @@ fn main() {
     let mut segment_peak_score: f32 = 0.0;
     let mut last_meter_at = Instant::now() - Duration::from_secs(1);
 
+    sys_counter = 0;
+
     loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
         if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(500)) {
             sample_buf.extend_from_slice(&chunk);
         }
@@ -518,6 +601,9 @@ fn main() {
             let frame: Vec<i16> = sample_buf.drain(..FRAME_SIZE).collect();
             let now = Instant::now();
             let r = engine.process_frame(&frame);
+
+            // Сбор статистики
+            stats.add_frame(r.rms, r.zcr, r.confirmed_voiced);
 
             match state {
                 State::Silence => {
@@ -562,34 +648,59 @@ fn main() {
                                 &profile,
                             );
                         }
-                        // Короче MIN_SEGMENT_MS - молча отбрасываем как щелчок/шум.
                     }
                 }
             }
 
-            // Живой однострочный индикатор с отладочной информацией -
-            // не более 12-13 раз в секунду, чтобы не грузить терминал.
+            // Живой индикатор + системные метрики
             if now.duration_since(last_meter_at) >= Duration::from_millis(80) {
                 last_meter_at = now;
+
+                // Обновляем системные метрики раз в N тиков (чтобы не грузить sysinfo каждый кадр)
+                sys_counter += 1;
+                let mut cpu_str = String::new();
+                let mut ram_str = String::new();
+
+                if sys_counter % 5 == 0 {
+                    // Примерно раз в 400мс
+                    sys.refresh_process_specifics(
+                        pid,
+                        sysinfo::ProcessRefreshKind::new().with_cpu().with_memory(),
+                    );
+                    if let Some(process) = sys.process(pid) {
+                        let cpu = process.cpu_usage();
+                        let ram = process.memory();
+                        stats.add_system_metrics(cpu, ram);
+                        if DEBUG_LOGGING {
+                            cpu_str = format!("| CPU: {:>4.1}%", cpu);
+                            ram_str = format!("| RAM: {:>5} КБ", ram);
+                        }
+                    }
+                }
+
                 let label = match state {
                     State::Speech => "говорит",
                     State::Silence => "тишина ",
                 };
                 let filled = (r.score.clamp(0.0, 1.0) * 20.0) as usize;
                 let bar: String = "█".repeat(filled) + &"░".repeat(20 - filled);
-                
+
                 if DEBUG_LOGGING {
-                    // Показываем ZCR и RMS для отладки
                     let zcr_status = if r.zcr <= MAX_ZCR { "OK" } else { "ШУМ" };
                     print!(
-                        "{CLEAR_LINE}[{bar}] score {:.2} | ZCR {:.3} {} | RMS {:.0} | {}",
-                        r.score, r.zcr, zcr_status, r.rms, label
+                        "{CLEAR_LINE}[{bar}] score {:.2} | ZCR {:.3} {} | RMS {:.0} | {} {} {}",
+                        r.score, r.zcr, zcr_status, r.rms, label, cpu_str, ram_str
                     );
                 } else {
-                    print!("{CLEAR_LINE}[{bar}] score {:.2}  {label}", r.score);
+                    print!(
+                        "{CLEAR_line}[{bar}] score {:.2}  {} {} {}",
+                        r.score, label, cpu_str, ram_str
+                    );
                 }
                 io::stdout().flush().ok();
             }
         }
     }
+
+    print_final_stats(&stats);
 }
