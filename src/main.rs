@@ -26,12 +26,12 @@ const VAD_THRESHOLD: f32 = 0.5;
 
 // --- Параметры сглаживания/фильтрации -----------------------------------
 const HISTORY_FRAMES: usize = 8; // Уменьшено с 10 до 8 (компенсация увеличенного FRAME_SIZE)
-const ONSET_RATIO: f32 = 0.50; // Снижено с 0.75 до 0.50 для более чувствительного обнаружения речи
-const SUSTAIN_RATIO: f32 = 0.40; // Снижено с 0.60 до 0.40 для удержания состояния речи
+const ONSET_RATIO: f32 = 0.65; // Снижено с 0.75 до 0.50 для более чувствительного обнаружения речи
+const SUSTAIN_RATIO: f32 = 0.50; // Снижено с 0.60 до 0.40 для удержания состояния речи
 const HANGOVER_MS: u64 = 400;
 const MIN_SEGMENT_MS: u64 = 250;
 const NOISE_FLOOR_ALPHA: f32 = 0.05;
-const NOISE_FLOOR_MARGIN: f32 = 1.5;
+const NOISE_FLOOR_MARGIN: f32 = 2.0;
 
 const CALIBRATION_SECONDS: f32 = 3.0;
 
@@ -651,9 +651,9 @@ fn print_final_stats(stats: &VadStats) {
         stats.max_cpu
     );
     println!(
-        "🔹 Потребление RAM:       {:>6} КБ / {:>6} КБ",
-        stats.avg_ram(),
-        stats.max_ram
+        "🔹 Потребление RAM:       {:>6} МБ / {:>6} МБ",
+        stats.avg_ram() / 1024,
+        stats.max_ram / 1024
     );
     println!("{}\n", "=".repeat(60));
 }
@@ -786,7 +786,10 @@ fn main() {
         })
     } else {
         println!("Во время калибровки не удалось надёжно распознать голос.");
-        println!("Собрано кадров с речью: {} (требуется минимум 3)", cal_rms.len());
+        println!(
+            "Собрано кадров с речью: {} (требуется минимум 3)",
+            cal_rms.len()
+        );
         None
     };
 
