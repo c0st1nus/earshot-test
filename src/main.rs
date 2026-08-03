@@ -1,5 +1,5 @@
 //! Оптимизированный VAD с верификацией диктора
-//! 
+//!
 //! Версия 5: Полная оптимизация + Speaker Verification
 //! - Увеличен FRAME_SIZE до 512 (32мс вместо 16мс) для снижения CPU нагрузки на 40%
 //! - Удалена pitch detection из горячего цикла (перенесена только на калибровку)
@@ -20,12 +20,12 @@ use earshot::Detector;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 // --- Основные параметры VAD (ОПТИМИЗИРОВАНО) ----------------------------
-const FRAME_SIZE: usize = 512;  // Увеличено с 256 до 512 → 32мс вместо 16мс
+const FRAME_SIZE: usize = 512; // Увеличено с 256 до 512 → 32мс вместо 16мс
 const SAMPLE_RATE: u32 = 16_000;
 const VAD_THRESHOLD: f32 = 0.5;
 
 // --- Параметры сглаживания/фильтрации -----------------------------------
-const HISTORY_FRAMES: usize = 8;  // Уменьшено с 10 до 8 (компенсация увеличенного FRAME_SIZE)
+const HISTORY_FRAMES: usize = 8; // Уменьшено с 10 до 8 (компенсация увеличенного FRAME_SIZE)
 const ONSET_RATIO: f32 = 0.75;
 const SUSTAIN_RATIO: f32 = 0.60;
 const HANGOVER_MS: u64 = 400;
@@ -38,7 +38,7 @@ const CALIBRATION_SECONDS: f32 = 3.0;
 const CLEAR_LINE: &str = "\r\x1b[2K";
 const HPF_ALPHA: f32 = 0.97;
 const MAX_ZCR: f32 = 0.15;
-const MIN_CONSECUTIVE_FRAMES: usize = 2;  // Уменьшено с 3 до 2 (т.к. фреймы теперь больше)
+const MIN_CONSECUTIVE_FRAMES: usize = 2; // Уменьшено с 3 до 2 (т.к. фреймы теперь больше)
 const DEBUG_LOGGING: bool = true;
 
 // --- Speaker Verification параметры --------------------------------------
@@ -46,7 +46,7 @@ const MFCC_NUM_COEFFS: usize = 13;
 const MFCC_FRAME_LEN_MS: usize = 25;
 const MFCC_FRAME_SHIFT_MS: usize = 10;
 const NUM_MEL_FILTERS: usize = 26;
-const SPEAKER_SIMILARITY_THRESHOLD: f32 = 0.72;  // Порог схожести голосов (0.0-1.0)
+const SPEAKER_SIMILARITY_THRESHOLD: f32 = 0.72; // Порог схожести голосов (0.0-1.0)
 
 // --- Структура для профиля диктора (MFCC-based) -------------------------
 #[derive(Debug, Clone)]
@@ -68,35 +68,43 @@ impl SpeakerProfile {
             num_samples: 0,
         }
     }
-    
+
     fn from_samples(mfcc_samples: &[Vec<f32>], rms_samples: &[f32], zcr_samples: &[f32]) -> Self {
         if mfcc_samples.is_empty() {
             return Self::new();
         }
-        
+
         let n = mfcc_samples.len() as f32;
         let mut mean = vec![0.0; MFCC_NUM_COEFFS];
         let mut variance = vec![0.0; MFCC_NUM_COEFFS];
-        
+
         // Вычисляем среднее
         for sample in mfcc_samples {
             for (i, &val) in sample.iter().enumerate() {
                 mean[i] += val / n;
             }
         }
-        
+
         // Вычисляем дисперсию
         for sample in mfcc_samples {
             for (i, &val) in sample.iter().enumerate() {
                 variance[i] += (val - mean[i]).powi(2) / n;
             }
         }
-        
+
         let std: Vec<f32> = variance.iter().map(|&v| v.sqrt()).collect();
-        
-        let rms_avg = if rms_samples.is_empty() { 0.0 } else { rms_samples.iter().sum::<f32>() / rms_samples.len() as f32 };
-        let zcr_avg = if zcr_samples.is_empty() { 0.0 } else { zcr_samples.iter().sum::<f32>() / zcr_samples.len() as f32 };
-        
+
+        let rms_avg = if rms_samples.is_empty() {
+            0.0
+        } else {
+            rms_samples.iter().sum::<f32>() / rms_samples.len() as f32
+        };
+        let zcr_avg = if zcr_samples.is_empty() {
+            0.0
+        } else {
+            zcr_samples.iter().sum::<f32>() / zcr_samples.len() as f32
+        };
+
         Self {
             mfcc_mean: mean,
             mfcc_std: std,
@@ -105,16 +113,16 @@ impl SpeakerProfile {
             num_samples: mfcc_samples.len(),
         }
     }
-    
+
     fn similarity(&self, mfcc_vec: &[f32], rms: f32, zcr: f32) -> f32 {
         if self.num_samples == 0 {
             return 0.5;
         }
-        
+
         let mut dot_product = 0.0;
         let mut norm_profile = 0.0;
         let mut norm_sample = 0.0;
-        
+
         for i in 0..MFCC_NUM_COEFFS {
             let p = self.mfcc_mean[i];
             let s = mfcc_vec[i];
@@ -122,19 +130,19 @@ impl SpeakerProfile {
             norm_profile += p * p;
             norm_sample += s * s;
         }
-        
+
         let cosine_sim = if norm_profile > 0.0 && norm_sample > 0.0 {
             dot_product / (norm_profile.sqrt() * norm_sample.sqrt())
         } else {
             0.0
         };
-        
+
         let rms_diff = (self.rms_avg - rms).abs() / (self.rms_avg.max(0.001));
         let rms_factor = (1.0 - rms_diff.min(1.0)) * 0.2;
-        
+
         let zcr_diff = (self.zcr_avg - zcr).abs() / (self.zcr_avg.max(0.001));
         let zcr_factor = (1.0 - zcr_diff.min(1.0)) * 0.1;
-        
+
         (cosine_sim * 0.7 + rms_factor + zcr_factor).clamp(0.0, 1.0)
     }
 }
@@ -142,40 +150,45 @@ impl SpeakerProfile {
 // --- MFCC вычисление (упрощенное, без внешних библиотек) ----------------
 fn compute_mfcc(samples: &[i16]) -> Vec<f32> {
     const FFT_SIZE: usize = 512;
-    let num_frames = samples.len().saturating_sub(SAMPLE_RATE as usize * MFCC_FRAME_LEN_MS / 1000) 
-        / (SAMPLE_RATE as usize * MFCC_FRAME_SHIFT_MS / 1000) + 1;
-    
+    let num_frames = samples
+        .len()
+        .saturating_sub(SAMPLE_RATE as usize * MFCC_FRAME_LEN_MS / 1000)
+        / (SAMPLE_RATE as usize * MFCC_FRAME_SHIFT_MS / 1000)
+        + 1;
+
     if num_frames == 0 {
         return vec![0.0; MFCC_NUM_COEFFS];
     }
-    
+
     let mut all_coeffs = Vec::with_capacity(num_frames);
-    
+
     for frame_idx in 0..num_frames {
         let start = frame_idx * (SAMPLE_RATE as usize * MFCC_FRAME_SHIFT_MS / 1000);
         let end = (start + SAMPLE_RATE as usize * MFCC_FRAME_LEN_MS / 1000).min(samples.len());
         let frame = &samples[start..end];
-        
+
         let mut windowed = vec![0.0; FFT_SIZE];
         for (i, &sample) in frame.iter().enumerate() {
-            let hamming = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / frame.len() as f32).cos();
+            let hamming =
+                0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / frame.len() as f32).cos();
             windowed[i] = sample as f32 / 32768.0 * hamming;
         }
-        
+
         let spectrum = compute_power_spectrum(&windowed);
         let mel_energies = apply_mel_filterbank(&spectrum);
         let log_mel: Vec<f32> = mel_energies.iter().map(|&e| (e + 1e-10).ln()).collect();
         let coeffs = dct(&log_mel, MFCC_NUM_COEFFS);
-        
+
         all_coeffs.push(coeffs);
     }
-    
+
     if all_coeffs.is_empty() {
         return vec![0.0; MFCC_NUM_COEFFS];
     }
-    
+
     let coeff_count = all_coeffs.len() as f32;
-    all_coeffs.into_iter()
+    all_coeffs
+        .into_iter()
         .fold(vec![0.0; MFCC_NUM_COEFFS], |acc, x| {
             acc.iter().zip(x.iter()).map(|(&a, &b)| a + b).collect()
         })
@@ -187,7 +200,7 @@ fn compute_mfcc(samples: &[i16]) -> Vec<f32> {
 fn compute_power_spectrum(signal: &[f32]) -> Vec<f32> {
     let n = signal.len();
     let mut spectrum = vec![0.0; n / 2];
-    
+
     for k in 0..n / 2 {
         let mut real = 0.0;
         let mut imag = 0.0;
@@ -198,7 +211,7 @@ fn compute_power_spectrum(signal: &[f32]) -> Vec<f32> {
         }
         spectrum[k] = (real * real + imag * imag) / n as f32;
     }
-    
+
     spectrum
 }
 
@@ -206,26 +219,26 @@ fn apply_mel_filterbank(spectrum: &[f32]) -> Vec<f32> {
     let sample_rate = SAMPLE_RATE as f32;
     let fft_size = spectrum.len() * 2;
     let freq_resolution = sample_rate / fft_size as f32;
-    
+
     let mel_min = hz_to_mel(0.0);
     let mel_max = hz_to_mel(sample_rate / 2.0);
     let mel_step = (mel_max - mel_min) / (NUM_MEL_FILTERS + 1) as f32;
-    
+
     let mut energies = vec![0.0; NUM_MEL_FILTERS];
-    
+
     for i in 0..NUM_MEL_FILTERS {
         let center_mel = mel_min + (i + 1) as f32 * mel_step;
         let left_mel = center_mel - mel_step;
         let right_mel = center_mel + mel_step;
-        
+
         let left_hz = mel_to_hz(left_mel);
         let center_hz = mel_to_hz(center_mel);
         let right_hz = mel_to_hz(right_mel);
-        
+
         let left_bin = ((left_hz / freq_resolution) as usize).min(spectrum.len() - 1);
         let center_bin = ((center_hz / freq_resolution) as usize).min(spectrum.len() - 1);
         let right_bin = ((right_hz / freq_resolution) as usize).min(spectrum.len() - 1);
-        
+
         let mut energy = 0.0;
         for bin in left_bin..=right_bin.min(spectrum.len() - 1) {
             let bin_hz = bin as f32 * freq_resolution;
@@ -236,10 +249,10 @@ fn apply_mel_filterbank(spectrum: &[f32]) -> Vec<f32> {
             };
             energy += spectrum[bin] * weight.max(0.0);
         }
-        
+
         energies[i] = energy;
     }
-    
+
     energies
 }
 
@@ -254,15 +267,16 @@ fn mel_to_hz(mel: f32) -> f32 {
 fn dct(input: &[f32], num_coeffs: usize) -> Vec<f32> {
     let n = input.len();
     let mut output = vec![0.0; num_coeffs];
-    
+
     for k in 0..num_coeffs {
         let mut sum = 0.0;
         for i in 0..n {
-            sum += input[i] * ((std::f32::consts::PI * (i as f32 + 0.5) * k as f32) / n as f32).cos();
+            sum +=
+                input[i] * ((std::f32::consts::PI * (i as f32 + 0.5) * k as f32) / n as f32).cos();
         }
         output[k] = sum * (2.0 / n as f32).sqrt();
     }
-    
+
     output
 }
 
@@ -444,7 +458,9 @@ fn median(v: &[f32]) -> Option<f32> {
         };
 
         let speaker_label = match (profile, pitch_med) {
-            (Some(p), Some(pm)) if pm >= p.pitch_min && pm <= p.pitch_max && rms_avg >= p.rms_avg * 0.7 => {
+            (Some(p), Some(pm))
+                if pm >= p.pitch_min && pm <= p.pitch_max && rms_avg >= p.rms_avg * 0.7 =>
+            {
                 "похож на калиброванный голос"
             }
             (Some(_), Some(_)) => "другой голос",
@@ -604,7 +620,7 @@ impl VadEngine {
         FrameResult {
             score,
             confirmed_voiced,
-            pitch: None,  // Pitch удален из горячего цикла для оптимизации CPU
+            pitch: None, // Pitch удален из горячего цикла для оптимизации CPU
             rms: level,
             zcr: zcr_val,
         }
