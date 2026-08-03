@@ -561,6 +561,10 @@ impl VadEngine {
             zcr: zcr_val,
         }
     }
+}
+
+fn print_final_stats(stats: &VadStats) {
+    println!(
         "⏱️  Длительность:          {:.2} сек",
         stats.duration().as_secs_f64()
     );
