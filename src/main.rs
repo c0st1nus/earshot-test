@@ -442,53 +442,53 @@ fn median(v: &[f32]) -> Option<f32> {
     if v.is_empty() {
         return None;
     }
-
-    fn report_segment(
-        duration: Duration,
-        peak_score: f32,
-        pitches: &[f32],
-        rms_values: &[f32],
-        profile: &Option<VoiceProfile>,
-    ) {
-        let pitch_med = median(pitches);
-        let rms_avg = if rms_values.is_empty() {
-            0.0
-        } else {
-            rms_values.iter().sum::<f32>() / rms_values.len() as f32
-        };
-
-        let speaker_label = match (profile, pitch_med) {
-            (Some(p), Some(pm))
-                if pm >= p.pitch_min && pm <= p.pitch_max && rms_avg >= p.rms_avg * 0.7 =>
-            {
-                "похож на калиброванный голос"
-            }
-            (Some(_), Some(_)) => "другой голос",
-            (Some(_), None) => "голос (без оценки высоты)",
-            (None, _) => "голос",
-        };
-
-        match pitch_med {
-            Some(pm) => println!(
-                "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | pitch ~{:.0} Гц | rms {:.0} | {}",
-                duration.as_millis(),
-                peak_score,
-                pm,
-                rms_avg,
-                speaker_label
-            ),
-            None => println!(
-                "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | rms {:.0} | {}",
-                duration.as_millis(),
-                peak_score,
-                rms_avg,
-                speaker_label
-            ),
-        }
-    }
     let mut sorted = v.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Some(sorted[sorted.len() / 2])
+}
+
+fn report_segment(
+    duration: Duration,
+    peak_score: f32,
+    pitches: &[f32],
+    rms_values: &[f32],
+    profile: &Option<VoiceProfile>,
+) {
+    let pitch_med = median(pitches);
+    let rms_avg = if rms_values.is_empty() {
+        0.0
+    } else {
+        rms_values.iter().sum::<f32>() / rms_values.len() as f32
+    };
+
+    let speaker_label = match (profile, pitch_med) {
+        (Some(p), Some(pm))
+            if pm >= p.pitch_min && pm <= p.pitch_max && rms_avg >= p.rms_avg * 0.7 =>
+        {
+            "похож на калиброванный голос"
+        }
+        (Some(_), Some(_)) => "другой голос",
+        (Some(_), None) => "голос (без оценки высоты)",
+        (None, _) => "голос",
+    };
+
+    match pitch_med {
+        Some(pm) => println!(
+            "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | pitch ~{:.0} Гц | rms {:.0} | {}",
+            duration.as_millis(),
+            peak_score,
+            pm,
+            rms_avg,
+            speaker_label
+        ),
+        None => println!(
+            "\n🗣️  Сегмент: {:.0}мс | score max {:.2} | rms {:.0} | {}",
+            duration.as_millis(),
+            peak_score,
+            rms_avg,
+            speaker_label
+        ),
+    }
 }
 
 fn estimate_pitch(window: &[i16], sample_rate: u32) -> Option<f32> {
